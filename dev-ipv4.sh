@@ -15,9 +15,51 @@ discorduri=""                                       # URI for Discord WebHook "h
 
 
 ###########################################
-## Recycle and reuse (EXPERIMENTAL)
+# Commands
 ###########################################
-error_codes=("400" "401" "402" "403" "404" "405" "406" "429" "500")
+Help()
+{
+    echo "Cloudflare DDNS Updater by K0p1-Git."
+    echo "Repo link : https://github.com/K0p1-Git/cloudflare-ddns-updater"
+    echo
+    echo "Usage: [-h|-d|-f]"
+    echo "Description:"
+    echo "-h    Print this help page."
+    echo "-d    Enable debug mode."
+    echo "-f    Ignore unchanged IP detection."
+}
+
+options=$(getopt -l "help,debug,force" -o "hdf" -a -- "$@")
+eval set -- "$options"
+
+while true; do
+    case $1 in
+        -h|--help)
+            Help
+            exit 0;;
+        -d|--debug)
+            debug=true
+            logger -s "DDNS Updater: Debug mode is ON";;
+        -f|--force)
+            bypass=true
+            logger -s "DDNS Updater: IP check bypass is ON";;
+        --)
+            shift
+            break;;
+    esac
+    shift
+done
+
+###########################################
+## Debug logger (to increase readability)
+###########################################
+bugger(){
+    msg=$1
+
+    if [ "${debug}" = true ]; then
+        logger -s "DDNS Updater: ${msg}"
+    fi
+}
 
 ###########################################
 ## Check if we have a public IP
@@ -27,41 +69,54 @@ ip=$(curl -s -4 https://cloudflare.com/cdn-cgi/trace | grep -E '^ip'); ret=$?
 if [[ ! $ret == 0 ]]; then # In the case that cloudflare failed to return an ip.
     # Attempt to get the ip from other websites.
     ip=$(curl -s https://api.ipify.org || curl -s https://ipv4.icanhazip.com)
+    bugger "Using IP from alternative websites..."
 else
     # Extract just the ip from the ip line from cloudflare.
     ip=$(echo $ip | sed -E "s/^ip=($ipv4_regex)$/\1/")
+    bugger "Using IP from Cloudflare..."
 fi
 
 # Use regex to check for proper IPv4 format.
 if [[ ! $ip =~ ^$ipv4_regex$ ]]; then
     logger -s "DDNS Updater: Failed to find a valid IP."
+    bugger "Response - ${ip}"
     exit 2
 fi
+
+bugger "Your IP is ${ip}"
 
 ###########################################
 ## Check and set the proper auth header
 ###########################################
 if [[ "${auth_method}" == "global" ]]; then
   auth_header="X-Auth-Key:"
+  bugger "Authentication method is set as 'global'."
 else
   auth_header="Authorization: Bearer"
+  bugger "Authentication method is set as 'token'."
 fi
 
 ###########################################
 ## Seek for the A record
 ###########################################
+error_codes=("400" "401" "402" "403" "404" "405" "406" "429" "500")
 
-logger "DDNS Updater: Check Initiated"
+logger -s "DDNS Updater: Check Initiated"
 record=$(curl --write-out "%{http_code}" -s -X GET "https://api.cloudflare.com/client/v4/zones/$zone_identifier/dns_records?type=A&name=$record_name" \
                       -H "X-Auth-Email: $auth_email" \
                       -H "$auth_header $auth_key" \
                       -H "Content-Type: application/json")
 
 status=$(echo $record | tail -c 4)
+
+bugger "Record check response - ${record::-4}"
+
 if [[ " ${error_codes[*]} " =~ " ${status} " ]]; then
-  logger -s "DDNS Updater: Error while checking record identifier! Response: ${record::-4}"
+  logger -s "DDNS Updater: Error while checking record identifier!"
   exit 1
 fi
+
+bugger "Record check request completed without errors."
 
 ###########################################
 ## Check if the domain has an A record
@@ -74,17 +129,25 @@ fi
 ###########################################
 ## Get existing IP
 ###########################################
-old_ip=$(echo "$record" | sed -E 's/.*"content":"(([0-9]{1,3}\.){3}[0-9]{1,3})".*/\1/')
 # Compare if they're the same
-if [[ $ip == $old_ip ]]; then
-  logger "DDNS Updater: IP ($ip) for ${record_name} has not changed."
-  exit 0
+old_ip=$(echo "$record" | sed -E 's/.*"content":"(([0-9]{1,3}\.){3}[0-9]{1,3})".*/\1/')
+bugger "Domain record (${record_name}) is holding IP (${old_ip})."
+
+if [ "${bypass}" = true ]; then
+  logger -s "DDNS Updater: Bypassing IP checks..."
+else
+  if [[ $ip == $old_ip ]]; then
+    logger -s "DDNS Updater: IP ($ip) for ${record_name} has not changed."
+    exit 0
+  fi
 fi
 
 ###########################################
 ## Set the record identifier from result
 ###########################################
 record_identifier=$(echo "$record" | sed -E 's/.*"id":"(\w+)".*/\1/')
+
+bugger "Record identifier is \"${record_identifier}\"."
 
 ###########################################
 ## Change the IP@Cloudflare using the API
@@ -96,17 +159,15 @@ update=$(curl --write-out "%{http_code}" -s -X PATCH "https://api.cloudflare.com
                      --data "{\"type\":\"A\",\"name\":\"$record_name\",\"content\":\"$ip\",\"ttl\":\"$ttl\",\"proxied\":${proxy}}")
 
 status=$(echo $update | tail -c 4)
-if [[ " ${error_codes[*]} " =~ " ${status} " ]]; then
-  logger -s "DDNS Updater: Error while completing API request! Response: ${update::-4}"
-  exit 1
-fi
 
-###########################################
-## Report the status
-###########################################
-case "$update" in
-*"\"success\":false"*)
-  # echo -e "DDNS Updater: $ip $record_name DDNS failed for $record_identifier ($ip). DUMPING RESULTS:$update" | logger -s 
+bugger "Domain update response - ${update::-4}"
+####################
+## Update Failed
+####################
+if [[ " ${error_codes[*]} " =~ " ${status} " ]] || [[ " ${update} " =~ "\"success\":false" ]]; then
+  logger -s "DDNS Updater: Error while completing update API request!"
+
+  ### Slack
   if [[ $slackuri != "" ]]; then
     curl -L -X POST $slackuri \
     --data-raw '{
@@ -114,15 +175,23 @@ case "$update" in
       "text" : "'"$sitename"' DDNS Update Failed: '$record_name': '$record_identifier' ('$ip')."
     }'
   fi
+  ### Discord
   if [[ $discorduri != "" ]]; then
     curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
     --data-raw '{
       "content" : "'"$sitename"' DDNS Update Failed: '$record_name': '$record_identifier' ('$ip')."
     }' $discorduri
   fi
-  exit 1;;
-*)
-  logger "DDNS Updater: $ip $record_name DDNS updated."
+
+  logger -s "DDNS Updater: Failed to update IP ($ip) for $record_name."
+  exit 1
+####################
+## Update Success
+####################
+else
+  bugger "Domain IP update request completed without errors."
+  
+  ### Slack
   if [[ $slackuri != "" ]]; then
     curl -L -X POST $slackuri \
     --data-raw '{
@@ -130,11 +199,14 @@ case "$update" in
       "text" : "'"$sitename"' Updated: '$record_name''"'"'s'""' new IP Address is '$ip'"
     }'
   fi
+  ### Discord
   if [[ $discorduri != "" ]]; then
     curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST \
     --data-raw '{
       "content" : "'"$sitename"' Updated: '$record_name''"'"'s'""' new IP Address is '$ip'"
     }' $discorduri
   fi
-  exit 0;;
-esac
+
+  logger -s "DDNS Updater: $ip $record_name DDNS updated."
+  exit 0
+fi
